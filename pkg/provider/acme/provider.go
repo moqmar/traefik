@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	fmtlog "log"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -66,6 +67,7 @@ type DNSChallenge struct {
 	DelayBeforeCheck        parse.Duration     `description:"Assume DNS propagates after a delay in seconds rather than finding and querying nameservers."`
 	Resolvers               types.DNSResolvers `description:"Use following DNS servers to resolve the FQDN authority."`
 	DisablePropagationCheck bool               `description:"Disable the DNS propagation checks before notifying ACME that the DNS challenge is ready. [not recommended]"`
+	Environment             []string           `description:"Specify environment variables for the DNS provider."`
 
 	preCheckTimeout  time.Duration
 	preCheckInterval time.Duration
@@ -225,7 +227,50 @@ func (p *Provider) Provide(configurationChan chan<- config.Message, pool *safe.P
 	return nil
 }
 
-func (p *Provider) getClient() (*lego.Client, error) {
+// Store environment variables for different DNS provider settings
+var storedEnvironment = mapEnvironment(os.Environ())
+var environmentMutex = &sync.Mutex{}
+
+func mapEnvironment(e []string) map[string]string {
+	r := map[string]string{}
+	for _, variable := range e {
+		split := strings.SplitN(variable, "=", 2)
+		r[split[0]] = split[1]
+	}
+	return r
+}
+func storeEnvironment() {
+	environmentMutex.Lock()
+	storedEnvironment = mapEnvironment(os.Environ())
+}
+func restoreEnvironment() {
+	currentEnvironment := mapEnvironment(os.Environ())
+	for k := range currentEnvironment {
+		if _, ok := storedEnvironment[k]; !ok {
+			os.Setenv(k, "")
+		}
+	}
+	for k, v := range storedEnvironment {
+		if variable, ok := currentEnvironment[k]; !ok || variable != v {
+			os.Setenv(k, v)
+		}
+	}
+	environmentMutex.Unlock()
+}
+func applyEnvironment(e []string) {
+	if e != nil {
+		for _, v := range e {
+			print("ENV " + v + "\n")
+			s := strings.SplitN(v, "=", 2)
+			if len(s) < 2 {
+				s = append(s, "")
+			}
+			os.Setenv(s[0], s[1])
+		}
+	}
+}
+
+func (p *Provider) getClient(domain types.Domain) (*lego.Client, error) {
 	p.clientMutex.Lock()
 	defer p.clientMutex.Unlock()
 
@@ -278,15 +323,34 @@ func (p *Provider) getClient() (*lego.Client, error) {
 		return nil, err
 	}
 
+	fmt.Printf("%+v %+v %+v %+v %+v %+v\n",
+		p.HTTPChallenge != nil,
+		p.HTTPChallenge != nil && len(p.HTTPChallenge.EntryPoint) > 0,
+		domain.Challenge == "",
+		strings.ToLower(domain.Challenge) == "http",
+		p.TLSChallenge != nil,
+		strings.ToLower(domain.Challenge) == "tls",
+	)
+
 	switch {
-	case p.DNSChallenge != nil && len(p.DNSChallenge.Provider) > 0:
-		logger.Debugf("Using DNS Challenge provider: %s", p.DNSChallenge.Provider)
+	case p.DNSChallenge != nil && len(p.DNSChallenge.Provider) > 0 && (domain.Challenge == "" || strings.ToLower(domain.Challenge) == "dns"):
+		providerString := p.DNSChallenge.Provider
+		if domain.DNSProvider != "" {
+			providerString = domain.DNSProvider
+		}
+		logger.Debugf("Using DNS Challenge provider: %s", providerString)
+
+		storeEnvironment()
+		applyEnvironment(p.DNSChallenge.Environment)
+		applyEnvironment(domain.DNSEnvironment)
 
 		var provider challenge.Provider
-		provider, err = dns.NewDNSChallengeProviderByName(p.DNSChallenge.Provider)
+		provider, err = dns.NewDNSChallengeProviderByName(providerString)
 		if err != nil {
 			return nil, err
 		}
+
+		restoreEnvironment()
 
 		err = client.Challenge.SetDNS01Provider(provider,
 			dns01.CondOption(len(p.DNSChallenge.Resolvers) > 0, dns01.AddRecursiveNameservers(p.DNSChallenge.Resolvers)),
@@ -312,7 +376,7 @@ func (p *Provider) getClient() (*lego.Client, error) {
 			p.DNSChallenge.preCheckTimeout, p.DNSChallenge.preCheckInterval = challengeProviderTimeout.Timeout()
 		}
 
-	case p.HTTPChallenge != nil && len(p.HTTPChallenge.EntryPoint) > 0:
+	case (p.HTTPChallenge != nil && len(p.HTTPChallenge.EntryPoint) > 0) && (domain.Challenge == "" || strings.ToLower(domain.Challenge) == "http"):
 		logger.Debug("Using HTTP Challenge provider.")
 
 		err = client.Challenge.SetHTTP01Provider(&challengeHTTP{Store: p.Store})
@@ -320,7 +384,7 @@ func (p *Provider) getClient() (*lego.Client, error) {
 			return nil, err
 		}
 
-	case p.TLSChallenge != nil:
+	case p.TLSChallenge != nil && (domain.Challenge == "" || strings.ToLower(domain.Challenge) == "tls"):
 		logger.Debug("Using TLS Challenge provider.")
 
 		err = client.Challenge.SetTLSALPN01Provider(&challengeTLSALPN{Store: p.Store})
@@ -435,7 +499,8 @@ func (p *Provider) resolveCertificate(ctx context.Context, domain types.Domain, 
 	logger := log.FromContext(ctx)
 	logger.Debugf("Loading ACME certificates %+v...", uncheckedDomains)
 
-	client, err := p.getClient()
+	print("GET_CLIENT " + domain.Main + "\n")
+	client, err := p.getClient(domain)
 	if err != nil {
 		return nil, fmt.Errorf("cannot get ACME client %v", err)
 	}
@@ -683,7 +748,7 @@ func (p *Provider) renewCertificates(ctx context.Context) {
 		// If there's an error, we assume the cert is broken, and needs update
 		// <= 30 days left, renew certificate
 		if err != nil || crt == nil || crt.NotAfter.Before(time.Now().Add(24*30*time.Hour)) {
-			client, err := p.getClient()
+			client, err := p.getClient(cert.Domain)
 			if err != nil {
 				logger.Infof("Error renewing certificate from LE : %+v, %v", cert.Domain, err)
 				continue
